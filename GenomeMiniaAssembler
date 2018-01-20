@@ -1,0 +1,2347 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+ MiniaGenomeAssembler
+ Pipeline to assemble Illumina reads using Minia assembler
+
+=cut
+
+our $version = '0.1.0';
+our $progname = "GenomeMiniaAssembler";
+
+=head1 SYPNOSIS
+
+ MiniaGenomeAssembler [-h] -i <input_file_list> -o <output_directory>
+                           [-t <threads>] [-l <min_contig_length>]
+                           [-k <kmer_interval>] 
+                           [-m <minia_arguments>]
+                           [-s <sspace_arguments>]
+                           [-r <remove_int_files>]
+                           [-g <est_genome_size>]
+                           [-F]
+
+=head2 I<Flags:>
+
+=over
+
+
+=item -i
+
+B<input_file_list>        four column file with filenames (mandatory)
+
+=item -t
+
+B<number_of_threads>      number of threads (default 2)
+
+=item -k
+
+B<kmer_interval>          kmer interval to optimize kmer size (default 31-95)
+
+=item -l
+
+B<min_contig_length>      minimum contig length (default 200 bp)
+
+=item -o
+
+B<output_dir>             output directory (mandatory)
+
+=item -m
+
+B<minia_arguments>        pass minia arguments as '-arg1=val1,-arg2=val2'
+
+=item -s
+
+B<sspace_arguments>       pass sspace arguments as '-arg1=val1,-arg2=val2' 
+
+=item -r
+
+B<remove_int_files>       remove intermediate files (default: all)
+
+=item -g
+
+B<est_genome_size>        estimated genome size (e.g: 100000K, 100M or 0.1G)
+
+=item -F
+
+B<force_rerun>            force to rerun all the steps
+
+=item -V
+
+B<be_verbose>             be verbose and print the parsing status.
+
+=item -v
+
+B<version>                print version
+
+=item -h
+
+B<help>                   print the help
+
+=back
+
+=cut
+
+=head1 DESCRIPTION
+
+ This program uses Minia and SSPACE to assemble Illumina reads. It performs
+ the optimization of the kmer size using different kmers sizes in an interval
+ and selecting the best one in several rounds.
+
+ E.g. GenomeMiniaAssembler -i LibList2017.txt -l 100 -k 63-127 -t 60 
+      -m '-max-memory=20000' -o GMA2017 
+
+ STEPS:
+  0- Check the executables for the following programs:
+     * Fastq-stats
+     * Seqtk
+     * Jellyfish.
+     * Minia
+     * SSPACE
+     * Bowtie2
+     * Samtools
+     * Picard-tools
+     * GapCloser
+     * Bcftools
+     * Bedtools
+     * FreeBayes
+     * Rscript and genomescope.R (X11 has to be active)
+
+     Check also that the input file has the following fields
+     -c1: LibraryID
+     -c2: LibraryType (S, FR, RF)
+     -c3: FileName (including the FilePath)
+     -c4: OrderInPair (0 = S; 1 or 2 for FR or RF)      
+
+  1- First Kmer sizes computation for the interval KmerX-KmerY. KmerX and KmerY 
+     have to be ODD. The 5 selected Kmers will be:
+    
+     * KmerX,
+     * KmerY,
+     * KmerA = KmerX+KmerY/2 [+1 if it is EVEN].
+     * KmerB = KmerX+KmerA/2 [+1 if it is EVEN].
+     * KmerC = KmerA+KmerY/2 [+1 if it is EVEN].
+
+  2- Calculate the estimated genome size and heterozygosity for each of the
+     Kmers using Jellyfish. The program will parse the output and keep the
+     information (EstGenomeSize_KmerXX; EstHeterozygosity_KmerXX). Genome size
+     can be also supplied with the option -g using different units as 
+     K=Kb, M=Mb or G=Gb (e.g. 100M or 1G).
+      
+  3- Run one Minia assembly per Kmer. After the assembly, it will evaluate 
+     the following parameters:
+     * LongestContig.
+     * N_Contigs1K, N_Contigs10K, N_Contigs100K.
+     * DesviationEstimatedGenomeSize
+     * N50/L50
+
+     It will rank each parameter, and then it will select the lower sum of
+     the ranks.
+  
+  4- Once the best assembly has been selected will get the neighboors and 
+     calculate one/two new kmers.
+
+     * If the best assembly is KmerX it will perform KmerX+KmerB/2 
+       [+1 if it is EVEN].
+     * If the best assembly is KmerB it will perform KmerX+KmerB/2 
+       [+1 if it is EVEN] and KmerB+KmerA/2 [+a if it is EVEN].
+     * If the best assembly is KmerA it will perform KmerC+KmerA/2 
+       [+1 if it is EVEN] and KmerB+KmerA/2 [+a if it is EVEN].
+     * If the best assembly is KmerC it will perform KmerC+KmerY/2 
+       [+1 if it is EVEN] and KmerC+KmerA/2 [+a if it is EVEN].
+     * If the best assembly is KmerY it will perform KmerC+KmerY/2 
+       [+1 if it is EVEN].
+
+     After the assembly, it will evaluate all the assemblies again, selecting
+     the best one and calculating the new kmers. The process will end when the
+     best assembly is found for a specific Kmer (KmerBest) and the surrounding
+     kmers have been calculated.
+
+  5- Once the best assembly has been found, it will continue running SSPACE
+     to scaffold the contigs. It will run first Bowtie2 keeping the mapped 
+     reads.
+  
+  6- It will run also GapCloser to fill the possible gaps.
+
+  7- After the scaffolding, the program will re-map the reads back to the 
+     assembly and calculate:
+     
+     * Coverage, using Bedtools.
+     * Heterozigosity and consensus call, using Freebayes
+     * Stats about the assembly
+  
+  Some of the steps produce big files such as Jellyfish and Minia. The option
+  -r <remove_intermediate_files> delete them. By default this option is switch
+  as 'all' that it is equivalent to 'jellyfish_count,minia_h5'
+
+
+=cut
+
+=head1 AUTHORS
+
+  Aureliano Bombarely
+  (aurebg@vt.edu).
+
+=cut
+
+=head1 METHODS
+
+ GenomeMiniaAssembler
+
+
+=cut
+
+use strict;
+use warnings;
+use autodie;
+
+use Getopt::Std;
+use File::Spec;
+use File::Basename;
+use File::Copy;
+use File::Path qw(make_path remove_tree);
+use IPC::Cmd qw[can_run run];
+
+use Bio::SeqIO;
+
+use Math::BigFloat;
+
+our ($opt_i, $opt_o, $opt_t, $opt_l, $opt_k, $opt_m, $opt_s, $opt_r, $opt_g, 
+     $opt_F, $opt_V, $opt_v, $opt_h);
+getopts("i:o:t:l:k:m:s:r:g:FVvh");
+if (!$opt_i && !$opt_o && !$opt_t && !$opt_l && !$opt_k && !$opt_m && !$opt_s
+    && !$opt_r && !$opt_g && !$opt_F && !$opt_V && !$opt_v && !$opt_h) {
+    print "There are n\'t any tags. Print help\n\n";
+    help();
+}
+if ($opt_h) {
+    help();
+}
+elsif ($opt_v) {
+    print STDERR "\n$progname version:$version\n";
+    print STDERR "Developed at the Bombarely Laboratory (2017-12-26)\n\n";
+    exit(1);
+}
+
+my $date = `date`;
+chomp($date);
+print STDERR "\n\n############################################################";
+print STDERR "\n## $progname Starts ($date) ##\n";
+print STDERR "############################################################\n\n";
+
+## Define a variable to keep the stats;
+
+my %gstats = ();
+
+print_header("0) Checking arguments");
+
+##############################################################################
+## CHECK ARGUMENTS
+##############################################################################
+
+## First lets create a log file and print the first message
+
+my $timestamp = `date +"%y%m%d%H%M%S"`;
+chomp($timestamp);
+
+open my $logfh, '>', $progname.$timestamp.".log";
+printlog($logfh, "00", "ACTION", "$progname starts", 0);
+
+## Get the arguments and check them
+
+## 0.1- CHECK INPUT FILE
+
+my $infilelist = $opt_i || 
+    die("\nINPUT ARG. ERROR: -i <input_file> argument was not supplied.\n\n");
+
+printlog($logfh, "00", "CHECKING_POINT", "Input readfiles list: $infilelist",1);
+
+## The script will process the file and check that the file PATH is correct
+## The input file should be something like:
+##     -c1: LibraryID
+##     -c2: LibraryType (S, FR, RF)
+##     -c3: FileName (including the FilePath)
+##     -c4: OrderInPair (0 = S; 1 or 2 for FR or RF)
+## It will parse the file and create the hash inlibs with the following struct.
+## %inlib = ( LibID => { type => LibType, files => { FileOrder => FilePath}})
+
+my %inlibs = ();
+my $infl_l = 0;
+
+open my $infh, '<', $infilelist;
+while (<$infh>) {
+
+    chomp($_); 
+    $infl_l++;
+    my @cols = split(/\t/, $_);
+
+    ## Run several checks
+    if (scalar(@cols) != 4) {
+    
+	my $error = "File:$infilelist\tLine:$infl_l\thas not 4 columns.";
+	printlog($logfh, "00", "ERROR", $error, 1);
+	die("\nERROR: $error\n\n");
+    }
+    unless (-s $cols[2]) {
+    
+	my $error = "File:$cols[2] does not exists or the path is wrong";
+	printlog($logfh, "00", "ERROR", $error, 1);
+	die("\nERROR: $error\n\n");
+    }
+    
+    if (exists $inlibs{$cols[0]}) {
+    
+	## It will add only the files
+	$inlibs{$cols[0]}->{files}->{$cols[3]} = $cols[2]; 
+    }
+    else {
+    
+	$inlibs{$cols[0]} = { 
+	    type  => $cols[1],
+	    files => { $cols[3] => $cols[2] } 
+	};
+    }
+}
+close($infh);
+
+## Print a message about the libraries
+printlog($logfh, "00", "CHECKING_POINT", "Input List of Libraries",1);
+
+foreach my $libname (sort keys %inlibs) {
+
+    my $libtype = $inlibs{$libname}->{type};
+    my %libfiles = %{$inlibs{$libname}->{files}};
+    foreach my $file_n (sort {$a <=> $b} keys %libfiles) {
+    
+	my $pline = "$libname\t$libtype\t$libfiles{$file_n}\t$file_n";
+	printlog($logfh, "00", "CHECKING_POINT", $pline ,1);
+    }
+}
+print STDERR "\n";
+
+## 0.2 CHECK THE OUTPUT DIRECTORY
+
+my $outdir = $opt_o ||
+    die("\nINPUT ARG. ERROR: -o <output_dir> argument was not supplied.\n\n");
+
+printlog($logfh, "00", "CHECKING_POINT", "Output directory: $outdir", 1);
+
+unless (-d $outdir) {
+
+    my $error = "$outdir directory does not exist. Please create it before run";
+    printlog($logfh, "00", "ERROR", $error , 0);
+    die("\nERROR: $error\n\n");
+}
+
+## 0.3 CHECK THE NUMBER OF THREADS
+
+my $threads = $opt_t || 1;
+if ($threads !~ m/^\d+$/) {
+    
+    my $error = "-t <threads> has not a numeric value.";
+    printlog($logfh, "00", "ERROR", $error, 0);
+    die("ERROR: $error\n"); 
+}
+else {
+
+    printlog($logfh, "00", "CHECKING_POINT", "Number of threads: $threads", 1);
+}
+
+## 0.4 CHECK THE KMER RANGE
+
+my $kmer_range = $opt_k || "31-95";
+my $kmer_min = "";
+my $kmer_max = "";
+if ($kmer_range =~ m/^(\d+)-(\d+)$/) {
+
+    $kmer_min = $1;
+    $kmer_max = $2;
+    my $mss = "Kmer range from $kmer_min to $kmer_max";
+    printlog($logfh, "00", "CHECKING_POINT", $mss, 1);
+}
+else {
+    
+    my $error = "-k <minkmer-maxkmer> option does not have the correct format.";
+    printlog($logfh, "00", "ERROR", $error, 0);
+    die("ERROR: $error\n");
+}
+
+## 0.5 CHECK THE MINIMUM LENGTH
+
+my $min_length = $opt_l || 200;
+if ($min_length !~ m/^\d+$/) {
+
+    my $error = "-l <min_length> is not a numeric value.";
+    printlog($logfh, "00", "ERROR", $error, 0);
+    die("ERROR: $error\n"); 
+}
+else {
+
+    my $msg = "\tMin. contig length: $min_length\n";
+    printlog($logfh, "00", "CHECKING_POINT", $msg, 1);
+}
+
+## 0.6 CHECK REMOVE FILES
+
+my $remove_list = $opt_r || 'all';
+
+my %rm_switch = ();
+my %rm_permit = (
+    'jellyfish_count' => 1,
+    'minia_h5'        => 1,
+    'minia_glue'      => 1,
+    );
+
+if ($remove_list eq 'all') {
+
+    $remove_list = join(",", keys %rm_permit);
+    foreach my $rm_item (keys %rm_permit) {
+    
+	$rm_switch{$rm_item} = 1;
+    }    
+}
+elsif ($remove_list eq 'none') {
+
+    ##Switch to zero the rm options
+    foreach my $rm_item (keys %rm_permit) {
+    
+	$rm_switch{$rm_item} = 0;
+    }
+}
+else {
+    
+    foreach my $rm_item (split(/,/, $remove_list)) {
+
+	unless (exists $rm_permit{$rm_item}) {
+    
+	    my $l = join("\t\n", sort keys %rm_permit);
+	    my $error = "$rm_item is not in the list of -r <remove_file>\n$l";
+	    printlog($logfh, "00", "ERROR", $error, 0);
+	    die("ERROR: $error\n");
+	}
+	else {
+	    
+	    $rm_switch{$rm_item} = 1;
+	}
+    }
+}
+my $msg01 = "Intermediate files to remove: $remove_list";
+printlog($logfh, "00", "CHECKING_POINT", $msg01, 1);
+
+## Check the expected genome size
+
+my $pref_estGS = 0;
+if ($opt_g) {
+
+    if ($opt_g =~ m/^(\d+)(\w)$/) {
+    
+	my $int = $1;
+	my $unit = $2;
+
+	my %mult = ( K => 1000, M => 1000000, G => 1000000000);
+	$pref_estGS = $int * $mult{$unit};
+	my $msg02 = "\t\tPre-estimated genome size: $pref_estGS\n";
+	printlog($logfh, "00", "CHECKING_POINT", $msg02, 1);
+    }
+    else {
+    
+	my $error = "-g <est_genome_size> do not have the format INT+K/M/G";
+	printlog($logfh, "00", "ERROR", $error, 0);
+	die("\nERROR: $error\n");
+    }
+} 
+
+
+## It will skip the pass of the arguments until it check the executables for
+## * Fastq-stats
+## * Jellyfish.
+## * Minia
+## * SSPACE
+## * Bowtie2
+## * Samtools
+## * GapCloser
+## * Bcftools
+## * Bedtools
+## * FreeBayes
+## * Picard-tools
+## * Rscript and genomescope.R (X11 has to be active)
+
+## Check the executables
+
+printlog($logfh, "00", "CHECKING_POINT", "Checking Executables", 1);
+
+my %exec_list = (
+    FASTQSTATS_PATH  => ['fastq-stats'],
+    SEQTK_PATH       => ['seqtk'],
+    JELLYFISH_PATH   => ['jellyfish'],
+    MINIA_PATH       => ['minia'],
+    SSPACE_PATH      => ['SSPACE_Standard_v3.0.pl', 'sam_bam2tab.pl'],
+    GAPCLOSER_PATH   => ['GapCloser'],
+    BOWTIE2_PATH     => ['bowtie2', 'bowtie2-build'],
+    SAMTOOLS_PATH    => ['samtools'],
+    PICARDTOOLS_PATH => ['picard-tools'],
+    BCFTOOLS_PATH    => ['bcftools'],
+    BEDTOOLS_PATH    => ['bedtools'],
+    FREEBAYES_PATH   => ['freebayes'],
+    RSCRIPT_PATH     => ['Rscript']
+    ); 
+
+## Note: When you install SSPACE-LongRead.pl has the wrong interpreter
+##       it is used with perl.
+
+my %exepath = ();
+
+foreach my $exec_key (sort keys %exec_list) {
+
+    my @execitems = @{$exec_list{$exec_key}};
+    foreach my $e_item (@execitems) {
+
+	if (exists $ENV{$exec_key}) {
+    
+	    my $msg03 = "$exec_key PATH defined for $e_item executable";
+	    printlog($logfh, "00", "CHECKING_POINT", $msg03, 1);
+	    $exepath{$e_item} = File::Spec->catfile($ENV{$exec_key}, $e_item);
+	}
+	else {
+    
+	    my $exe_path = can_run($e_item);
+	    if ($exe_path) {
+		
+		$exepath{$e_item} = $exe_path;
+		my $msg04 = "$e_item is available in the PATH ($exe_path)";
+		printlog($logfh, "00", "CHECKING_POINT", $msg04, 1);
+	    }
+	    else {
+		
+		my $error = "$e_item executable ($exec_key package) is not ";
+		$error .= "accessible";
+		printlog($logfh, "00", "ERROR", $error, 0);
+		die("\tERROR: $error\n");
+	    }	   
+	}	
+    }
+}
+
+## Check the R script for GenomeScope
+if ($ENV{GENOMESCOPE_RSCRIPT} && -s $ENV{GENOMESCOPE_RSCRIPT}) {
+
+    my $msg05 = "Path to GenomeScope Script: $ENV{GENOMESCOPE_RSCRIPT}";
+    printlog($logfh, "00", "CHECKING_POINT", $msg05, 1);
+}
+else {
+
+    my $error = "GENOMESCOPE_RSCRIPT env. path is wrong or is not specified";
+    printlog($logfh, "00", "ERROR", $error, 0);
+    die("\tERROR: $error\n");
+}
+
+
+
+## Get the permited options
+
+my $minia_argsline = $opt_m;
+my %minia_args = ();
+
+## There are some options that should not be used because it will 
+## produce problems downstream to process the output
+
+my %minia_ban = (
+    '-graph'           => 1,
+    '-in'              => 1,
+    '-traversal'       => 1,
+    '-kmer-size'       => 1,
+    '-solid-kmers-out' => 1,
+    '-out'             => 1,
+    '-out-dir'         => 1,
+    '-nb-cores'        => 1
+    );
+
+if ($minia_argsline) {
+
+    my $minia_h = "$exepath{blasr} -h ";
+    $minia_h .= "| sed -r 's/^\\s+//' | grep '^-' | sed -r 's/\\s+.+//'";
+    my @minia_h_run = run( command => $minia_h );
+
+    my %perm_minia = ();
+    foreach my $minia_arg (split(/\n/, $minia_h_run[3]->[0])) {
+		       
+	$perm_minia{$minia_arg} = 1;
+    }
+
+    foreach my $m_argline (split(/,/, $minia_argsline)) {
+    
+	if ($m_argline =~ m/^(-\w+)=?(\w*)$/) {
+	
+	    my $m_arg = $1;
+	    my $m_val = $2;
+	    unless (exists $perm_minia{$m_arg}) {
+	    
+		my $error = "$m_arg is not Minia option";
+		printlog($logfh, "00", "ERROR", $error, 0);
+		die("\nMINIA OPTION ERROR: $error.\n");
+	    }
+	    else {
+	    
+		if (exists $minia_ban{$m_arg}) {
+	
+		    my $warn = "Minia argument $m_arg can not be used.";
+		    printlog($logfh, "00", "WARNING", $warn, 0);
+		    warn("\nWARNING: $warn\n");
+		}
+		else {
+
+		    $minia_args{$m_arg} = $m_val;
+		}
+	    }
+	}
+    }
+}
+
+## Get the permitted options for $opt_l
+
+my $sspace_argsline = $opt_s;
+my %sspace_args = ();
+
+## There are some options that should not be used because it will 
+## produce problems downstream to process the output
+
+my %sspace_ban = (
+    '-c' => 1,
+    '-p' => 1,
+    '-b' => 1,
+    '-s' => 1
+    );
+
+if ($sspace_argsline) {
+
+    my $sspace_h = "perl $exepath{'SSPACE_Standard_v3.0.pl'} 2>&1 "; 
+    ## Printed as STDERR
+    
+    $sspace_h .= "| grep '^-' | sed -r 's/\\s+.+//'";
+    my @sspace_h_run = run( command => $sspace_h );
+
+    my %perm_sspace = ();
+    foreach my $sspace_arg (split(/\n/, $sspace_h_run[3]->[0])) {
+		       
+	$perm_sspace{$sspace_arg} = 1;
+    }
+
+    foreach my $l_argline (split(/,/, $sspace_argsline)) {
+    
+	if ($l_argline =~ m/^(-\w+)=?(\w*)$/) {
+	
+	    my $l_arg = $1;
+	    my $l_val = $2;
+	    unless (exists $perm_sspace{$l_arg}) {
+	    
+		my $error = "$l_arg isnt SSPACE-Long option";
+		printlog($logfh, "00", "ERROR", $error, 0);
+		die("\nSSPACE OPTION ERROR: $error.\n");
+	    }
+	    else {
+	    
+		if (exists $sspace_ban{$l_arg}) {
+	
+		    my $warn = "SSPACE arg. $l_arg can not be used.";
+		    printlog($logfh, "00", "WARNING", $warn, 1);
+		    warn("\nWARNING: $warn\n");
+		}
+		else {
+
+		    $sspace_args{$l_arg} = $l_val;
+		}
+	    }
+	}
+    }
+}
+
+##############################################################################
+## STEP 0: Get the len of the reads
+##############################################################################
+
+my $msg06 = "Getting the length (and other stats) for the reads";
+printlog($logfh, "00", "ACTION", $msg06, 1);
+
+my %infilestats = ();
+
+my $s00_1_outdir = "00_1_InputFiles";
+my $s00_1_outpath =  File::Spec->catfile($outdir, $s00_1_outdir);
+
+unless (-e $s00_1_outpath) {
+
+    mkdir($s00_1_outpath);
+}
+
+foreach my $libname (sort keys %inlibs) {
+
+    my %libfiles = %{$inlibs{$libname}->{files}};
+    foreach my $file_n (sort {$a <=> $b} keys %libfiles) {
+	
+	printlog($logfh, "00", "ACTION", "Processing $libfiles{$file_n}...", 1);
+	my @s006_fastqstats_cmd = ("$exepath{'fastq-stats'}");
+	push(@s006_fastqstats_cmd, $libfiles{$file_n});
+
+	## It will get create a file with the stats so later on the
+	## script could skip this step
+	
+	my @filepath = File::Spec->splitpath($libfiles{$file_n});
+	my $filestats_out = $filepath[-1];
+	$filestats_out =~ s/\.\w+$//;
+	$filestats_out .= ".stats.txt";
+	my $filestats_path = File::Spec->catfile($s00_1_outpath,$filestats_out);
+	push(@s006_fastqstats_cmd, " > $filestats_path");
+	
+	my $s006_cmd = join(" ", @s006_fastqstats_cmd);
+	
+	## Now it will check if the file exists, if it exists or the option
+	## -F is set up, it will run it again
+
+	unless (-s $filestats_path || $opt_F) {
+
+	    my @s006_run = run( command => $s006_cmd, verbose => $opt_V );
+	    printlog($logfh, "00", "COMMAND", $s006_cmd, 0);
+	
+	    ## Add an empty hash for the file
+	    $infilestats{$libfiles{$file_n}} = {};
+
+	    ## The script will parse the arrayref from $s006_run that it is
+	    ## the STDOUT
+	    if ($s006_run[0] != 1) {
+
+		my $error = "$s006_cmd\nhas not been successful\n$s006_run[1]";
+		printlog($logfh, "00", "ERROR", $error, 0);
+		die("\nERROR: $error\n\n");
+	    }
+	}
+	else {
+
+	    my $msg07 = "OutStatFile found:\n\t$filestats_path\n\tSkiping step";
+	    $msg07 .= " (Use -F to force re-run)\n";
+	    printlog($logfh, "00", "RESULT", $msg07, 1);
+	}
+	
+	## Once the command has been run, it will parse the file
+
+	open my $stats_fh, '<', $filestats_path;
+	while(<$stats_fh>) {
+	
+	    chomp($_); 
+	    if ($_ =~ m/^(.+)\t(.+)$/) {
+			
+		$infilestats{$libfiles{$file_n}}->{$1} = $2;
+	    }
+	}
+    }
+}
+
+printlog($logfh, "00", "ACTION", "Printing read file summaries", 1);
+
+my $reads_n = 0;
+my @av_length = ();
+my $total_bases = 0;
+
+foreach my $infi (sort keys %infilestats) {
+
+    printlog($logfh, "00", "REPORT", "ReadStats for file: $infi", 1);
+
+    my %readstats = (
+	'01_READS'       => $infilestats{$infi}->{'reads'},
+	'02_LENGTH_MEAN' => $infilestats{$infi}->{'len mean'},
+	'03_TOTAL_BASES' => $infilestats{$infi}->{'total bases'}
+	);
+    
+    foreach my $readst (sort(keys(%readstats))) {
+    
+	printlog($logfh, "00", "REPORT", "\t\t$readst=$readstats{$readst}", 1);
+    }
+   
+    $reads_n += $infilestats{$infi}->{'reads'}; 
+    push(@av_length, $infilestats{$infi}->{'len mean'});
+    $total_bases += $infilestats{$infi}->{'total bases'};
+}
+
+## Estimate the average length for all the datasets
+my $total_avlength_obj = Math::BigFloat->new($total_bases/$reads_n);
+my $readlen = $total_avlength_obj->bceil();
+printlog($logfh, "00", "REPORT", "\t\t04_AVERAGE_READ_LENGTH=$readlen", 1);
+
+##############################################################################
+## STEP 1: Calculate the Kmers to run
+##############################################################################
+
+print_header("1) First Round Kmer Calculation for $kmer_range");
+my $ts003 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts003); 
+print $logfh "\n$ts003\tStep 1: First Round Kmer Calculation for $kmer_range\n";
+
+my @kmer_list01 = get_kmers($kmer_min, $kmer_max);
+
+my $pkmer_list01 = join(",", @kmer_list01);
+print STDERR "\tThe first round of kmers are: $pkmer_list01\n"; 
+print $logfh "$ts003\t01REPORT: KmersList: $pkmer_list01\n\n";
+
+###############################################################################
+## STEP 2: Run jellyfish for all the specified kmers
+###############################################################################
+
+print_header("2) Estimating genome size for $pkmer_list01 kmers");
+my $ts004 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts004); 
+print $logfh "\n$ts004\tStep 2: Estimating genome size $pkmer_list01 kmers\n";
+
+## Create a directory
+
+my $s01_1_outdir = "01_1_KmerRound01_GenomeSizeEst";
+my $s01_1_outpath =  File::Spec->catfile($outdir, $s01_1_outdir);
+
+unless (-e $s01_1_outpath) {
+
+    print STDERR "\n\tCreated the directory $s01_1_outdir\n";
+    print $logfh "$ts004\t02ACTION: Created the directory $s01_1_outdir\n";
+    mkdir($s01_1_outpath);  
+}
+
+## run the function est_genomesize()
+
+my ($estgenomesize_href, $modelfit_href) = est_genomesize(
+    \@kmer_list01, \%inlibs, \%exepath, $threads, $s01_1_outpath, \%rm_switch,
+    $logfh); 
+
+## Function to run jellyfish and GenomeScope for a list of kmers
+## inputs: 1- \@kmer_list01, arrayref with the list of integers with the kmers 
+##         2- \%infiles, hashref with list of input files
+##         3- \%exepath, hashref with the executable paths
+##         4- $s01_1_outpath, path for the output dir 
+## output: A- $egs_href, hashref with the estimated genome sizes produced with
+##            GenomeScope 
+##         B- $modelfit_egs_href, list of the model fit stats
+
+## Once the stats have been determined it will print a summary
+my $s016_jfoutname = "EstimatedGenomeSizeSummary01.txt"; 
+my $s016_jfoutpath =  File::Spec->catfile($s01_1_outpath, $s016_jfoutname);
+open my $s016_fh, '>', $s016_jfoutpath;
+
+my %s016_plines = (
+    Heterozygosity      => [], 
+    GenomeHaploidLength => [], 
+    GenomeRepeatLength  => [], 
+    GenomeUniqueLength  => [], 
+    ModelFit            => [], 
+    ReadErrorRate       => []
+    ); 
+
+my @s016_head = ("#Property");
+
+foreach my $kmer (sort {$a <=> $b } keys %{$estgenomesize_href}) {
+
+    push(@s016_head, $kmer . "_min");
+    push(@s016_head, $kmer . "_max");
+    
+    foreach my $prop (sort keys %{$estgenomesize_href->{$kmer}}) {
+    
+	push(@{$s016_plines{$prop}}, 
+	     $estgenomesize_href->{$kmer}->{$prop}->{min});
+	push(@{$s016_plines{$prop}}, 
+	     $estgenomesize_href->{$kmer}->{$prop}->{max});	
+    }
+}
+
+my $ts005 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts005); 
+print $logfh "\n$ts005\tStep 2: Printing GenomeSizeEstimation summary\n";
+
+my $s016_phead = join("\t", @s016_head);
+print $s016_fh "$s016_phead\n";
+foreach my $prop (sort keys %s016_plines) {
+
+    my $pline = join("\t", ($prop, @{$s016_plines{$prop}}));
+    print $s016_fh "$pline\n";
+}     
+
+print $logfh "\n$ts005\tStep 2: Retrieving the best model fit\n";
+
+## It will also calculate the best model fit
+my %modelfit = %{$modelfit_href};
+my @smfit01 = sort {$modelfit{$b} <=> $modelfit{$a}} keys %modelfit;
+my @first_smfit01 = split(/_/, $smfit01[0]);
+print STDERR "\n\tBEST MODEL FIT FOR GENOME SIZE ESTIMATION:\n";
+print STDERR "\t\tKmer = $first_smfit01[0]\t($first_smfit01[1])\n";
+
+my %best_gsest = %{$estgenomesize_href->{$first_smfit01[0]}};
+my $best_estGS = $best_gsest{GenomeHaploidLength}->{$first_smfit01[1]};
+print STDERR "\t\tGenomeHaploidLength = $best_estGS\n";
+
+print $logfh "$ts005\t02REPORT: BEST MODEL FIT FOR GENOME SIZE ESTIMATION:\n";
+print $logfh "$ts005\t02REPORT: Kmer=$first_smfit01[0]\t($first_smfit01[1])\n";
+print $logfh "$ts005\t02REPORT: GenomeHaploidLength=$best_estGS bp\n";
+
+foreach my $bprop (sort keys %best_gsest) {
+
+    my $gs_prop = $best_gsest{$bprop}->{$first_smfit01[1]};
+    print STDERR "\t\t\t$bprop\t$gs_prop\n";
+    print $logfh "$ts005\t02REPORT: $bprop\t$gs_prop\n";
+}
+
+## Check that we have a best estimated genome size
+
+my $optimalGS = "";
+$best_estGS =~ s/,//g;
+if ($best_estGS > 100) {
+
+    $optimalGS = $best_estGS;
+}
+elsif ($pref_estGS > 0) {
+
+    $optimalGS = $pref_estGS;
+}
+else {
+
+    my $error = "No genome size was supplied (-g) or could be estimated.\n";
+    print $logfh "$ts005\t02ERROR: $error\n";
+    die("\n\tERROR: $error\n");    
+}
+
+###############################################################################
+## STEP 3: Run minia for all the specified kmers
+###############################################################################
+
+print_header("3) Running Minia assembler for $pkmer_list01 kmers");
+
+my $ts006 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts006); 
+print $logfh "\n$ts006\tStep 3: Running Minia assembler for $pkmer_list01\n";
+
+## Create a directory
+
+my $s02_1_outdir = "02_1_KmerRound01_DeNovoAssembly";
+my $s02_1_outpath =  File::Spec->catfile($outdir, $s02_1_outdir);
+print STDERR "\n\tCreated the directory $s02_1_outdir\n";
+
+unless (-e $s02_1_outpath) {
+
+    mkdir($s02_1_outpath);  
+}
+
+## run the function run_minia()
+
+## Add the threads to minia args
+
+$minia_args{'-nb-cores'} = $threads;
+
+my %minia = run_minia(\@kmer_list01, \%inlibs, \%exepath, \%minia_args, 
+    $s02_1_outpath, \%rm_switch, $logfh, 3); 
+
+## Print a total summary of the stats
+
+my $s02_4_sumname = "MiniaAssembliesRound01Summary.txt";
+my $s02_4_sumpath =  File::Spec->catfile($s02_1_outpath, $s02_4_sumname);
+open my $s02_4_fh, '>', $s02_4_sumpath;
+
+my @s024_header = ("AssemblyParameter/Kmer");
+my %s024_body = ();
+foreach my $k01 (sort keys %minia) {
+
+    push(@s024_header, $k01);
+    foreach my $st (sort keys %{$minia{$k01}->{contig_stats}}) {
+	
+	if (exists $s024_body{$st}) {
+	    
+	    push(@{$s024_body{$st}}, $minia{$k01}->{contig_stats}->{$st});
+	}
+	else {
+	    
+	    $s024_body{$st} = [$st, $minia{$k01}->{contig_stats}->{$st}];
+	}
+    }
+}
+my $s024_pheader = join("\t", @s024_header); 
+print $s02_4_fh "#$s024_pheader\n";
+foreach my $k01_1 (sort keys %s024_body) {
+
+    my $pline = join("\t", @{$s024_body{$k01_1}});
+    print $s02_4_fh "$pline\n";
+}
+
+## Get the best assembly
+
+my $ts017 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts017); 
+
+print STDERR "\t3.4. Getting the best assembly for $pkmer_list01\n\n";
+print $logfh "$ts017\tStep 3: Getting the best assembly for $pkmer_list01\n";
+ 
+my $bestkmer = get_bestkmer(\%minia, $optimalGS, $s02_1_outpath, $logfh, 
+			    $s02_4_fh);
+
+print STDERR "\tBest Minia Assembly Kmer for round 1 = $bestkmer\n";
+my $ts018 = `date +"%y-%m-%d %H:%M:%S"`;
+chomp($ts018); 
+print $logfh "$ts018\t03REPORT: BestAssemblyKmer01=$bestkmer\n";
+
+###############################################################################
+## STEP 4: Optimizing the Minia assemblies
+###############################################################################
+
+## Once the best assembly is decided it will need to look for the second
+## round of kmers. It will get two ranges and then it will calculate 5 new 
+## kmers
+
+print_header("Optimizing Minia assemblies");
+
+my $round = 1;
+my $step = 3;
+my $finishminia = 0;
+my @kmerlist = @kmer_list01;
+
+while($finishminia == 0) {
+
+    $round++;
+    $step++;
+
+    print_header("Minia assemblies round $round");
+    
+    # Format the round to print
+    my $frd = sprintf("%02d", $round);
+    printlog($logfh, $frd, "ACTION", "Minia assembly round $round\n", 0);
+    printlog($logfh, $frd, "ACTION", "Calculating Kmers for round $round", 1);
+
+    my ($k02min, $k02max) = get_neighboor_kmers(\@kmerlist, $bestkmer);    
+    my @kmer_list02 = get_kmers($k02min, $k02max);
+
+    ## Once the kmer list is done check if they have been previously run
+    
+    my $complete = 0;
+    foreach my $kmer02 (@kmer_list02) {
+    
+	if (exists $minia{$kmer02}) {
+	
+	    printlog($logfh, $frd, "ACTION", "Kmer $kmer02 was already run", 1);
+	    $complete++;
+	}
+    }
+
+    print STDERR "\n";
+
+    if ($complete == scalar(@kmer_list02)) {
+    
+	## It means that all the kmers were run before
+	$finishminia = 1;
+	my $pkmerlist02 = join(",", @kmer_list02); 
+	printlog($logfh, $frd, "REPORT", 
+		 "All the $pkmerlist02 kmers were already used", 1);
+	printlog($logfh, $frd, "REPORT", 
+		 "Contig assembly optimization is done", 1);
+	print STDERR "\n";
+	printlog($logfh, $frd, "REPORT",
+	    "Best Minia Assembly Kmer=$bestkmer", 1);
+	
+    }
+    else {
+
+	my $pkmerlist02 = join(",", @kmer_list02);
+	printlog($logfh, $frd, "REPORT", 
+		 "Round $round Kmers are: $pkmerlist02", 1);
+
+	## Create a directory
+
+	my $s04_1_outdir = "0" . $step . "_1_KmerRound0" . $round . 
+	    "_DeNovoAssembly";
+	my $s04_1_outpath =  File::Spec->catfile($outdir, $s04_1_outdir);
+	
+	printlog($logfh, $frd, "ACTION", "Created the dir $s04_1_outdir\n", 1);
+
+	unless (-e $s04_1_outpath) {
+	    
+	    mkdir($s04_1_outpath);  
+	}
+
+	## Add the kmers to the list and check that there are new kmers to try
+
+	## run the function run_minia()
+
+	## It will remove from the @kmer_list02 the kmers that where already
+	## run
+
+	my @runkmers = ();
+	foreach my $k02 (@kmer_list02) {
+	    
+	    unless (exists $minia{$k02}) {
+		
+		push(@runkmers, $k02); 
+	    }
+	    else {
+		
+		printlog($logfh, $frd, "REPORT", "Minia Kmer $k02 " . 
+			 "assembly was already performed. Skipping", 1); 
+	    }
+	}
+
+	my %minia02 = run_minia(\@runkmers, \%inlibs, \%exepath, \%minia_args, 
+				$s04_1_outpath, \%rm_switch, $logfh, $step); 
+
+	## Print a total summary of the stats
+	
+	my $s04_4_name = "MiniaAssembliesRound".$round."Summary.txt";
+	my $s04_4_sumpath =  File::Spec->catfile($s04_1_outpath, 
+						 $s04_4_name);
+	open my $s04_4_fh, '>', $s04_4_sumpath;
+	
+	my @s044_header = ("AssemblyParameter/Kmer");
+	my %s044_body = ();
+	foreach my $k02 (sort keys %minia02) {
+	    
+	    push(@s044_header, $k02);
+	    foreach my $st (sort keys %{$minia02{$k02}->{contig_stats}}) {
+		
+		if (exists $s024_body{$st}) {
+		    
+		    push(@{$s024_body{$st}}, 
+			 $minia02{$k02}->{contig_stats}->{$st});
+		}
+		else {
+		    
+		    my $ctgvar = $minia02{$k02}->{contig_stats}->{$st};
+		    $s044_body{$st} = [$st, $ctgvar];
+		}
+	    }
+	}
+	my $s044_pheader = join("\t", @s044_header); 
+	print $s04_4_fh "#$s044_pheader\n";
+	foreach my $k02_1 (sort keys %s044_body) {
+	    
+	    my $pline = join("\t", @{$s044_body{$k02_1}});
+	    print $s04_4_fh "$pline\n";
+	}
+	
+	## Once the script got the stats, it will pass the minia assemblies
+	## to the minia hash
+	
+	foreach my $mk02 (sort keys %minia02) {
+	    
+	    $minia{$mk02} = $minia02{$mk02};
+	}
+
+	## Get the best assembly of all the minia
+	
+	printlog($logfh, $frd, "ACTION", "Getting the best assembly", 1);
+	my $ts021 = `date +"%y-%m-%d %H:%M:%S"`;
+	chomp($ts021); 
+	
+	$bestkmer = get_bestkmer(\%minia, $optimalGS, $s04_1_outpath, 
+				 $logfh, $s04_4_fh);
+	
+	my $msg08 = "Best Minia Assembly Kmer round $round = $bestkmer";
+	printlog($logfh, $frd, "REPORT", $msg08, 1);
+	
+	@kmerlist = sort(keys(%minia)); 
+	my $ckmerlist = join(",", @kmerlist); 
+	
+	printlog($logfh, $frd, "ACTION", "Updated kmer list $ckmerlist", 1);
+    }
+}
+
+###############################################################################
+## Step 5: Perform the scaffolding with SSPACE
+###############################################################################
+
+print_header("Performing a scaffolding for Minia $bestkmer assembly");
+
+my $best_ctgfile = $minia{$bestkmer}->{contig_file};
+
+## Add to sspace the threads
+$sspace_args{'-T'} = $threads;
+
+## Create an output directory
+
+my $s051_outdir = "0" . $step . "_1_SSPACE4MiniaKmer" . $bestkmer;
+my $s051_outpath = File::Spec->catfile($outdir, $s051_outdir);
+unless (-e $s051_outpath) {
+	    
+    mkdir($s051_outpath);
+}	
+
+my %sspace = run_sspace(\%exepath, \%sspace_args, \%inlibs, $best_ctgfile, 
+			$s051_outpath, $logfh);
+
+
+##############################################################################
+## PRINT END MESSAGES FOR THE SCRIPT
+##############################################################################
+
+$date = `date`;
+chomp($date);
+print STDERR "\n\n############################################################";
+print STDERR "\n## GenomeMiniaAssembler Ends ($date)   ##\n";
+print STDERR "############################################################\n\n";
+exit;
+
+
+##############################################################################
+##############################################################################
+##
+## FUNCTIONS
+##
+###############################################################################
+## function to print the script help
+###############################################################################
+
+sub help {
+  print STDERR <<EOF;
+  $0:
+
+      GenomeMiniaAssembler
+      Pipeline to assemble whole genomes using Minia assembler
+
+    Usage:
+
+      MiniaGenomeAssembler [-h] -i <input_file_list> -o <output_directory>
+                           [-t <threads>] [-l <min_contig_length>]
+                           [-k <kmer_interval>] 
+                           [-m <minia_arguments>]
+                           [-s <sspace_arguments>]
+
+    Description:
+
+      This program uses Minia and SSPACE to assemble Illumina reads. It performs
+      the optimization of the kmer size using different kmers sizes in an 
+      interval and selecting the best one in several rounds.
+
+      E.g. GenomeMiniaAssembler -i LibList2017.txt -l 100 -k 63-127 -t 60 
+           -m '-max-memory=20000' -o GMA2017 
+
+      STEPS:
+      0- Check the executables for the following programs:
+         * Fastq-stats
+	 * Seqtk
+	 * Jellyfish.
+         * Minia
+         * SSPACE
+         * Bowtie2
+         * Samtools
+         * GapCloser
+         * Bcftools
+         * Bedtools
+         * FreeBayes
+         * Rscript and genomescope.R (X11 has to be active)
+
+         Check also that the input file has the following fields
+         -c1: LibraryID
+         -c2: LibraryType (S, FR, RF)
+         -c3: FileName (including the FilePath)
+         -c4: OrderInPair (0 = S; 1 or 2 for FR or RF)      
+
+      1- First Kmer sizes computation for the interval KmerX-KmerY. 
+         KmerX and KmerY have to be ODD. The 5 selected Kmers will be:
+    
+         * KmerX,
+         * KmerY,
+         * KmerA = KmerX+KmerY/2 [+1 if it is EVEN].
+         * KmerB = KmerX+KmerA/2 [+1 if it is EVEN].
+         * KmerC = KmerA+KmerY/2 [+1 if it is EVEN].
+
+      2- Calculate the estimated genome size and heterozygosity for each of the
+         Kmers using Jellyfish. The program will parse the output and keep the
+         information (EstGenomeSize_KmerXX; EstHeterozygosity_KmerXX).
+      
+      3- Run one Minia assembly per Kmer. After the assembly, it will evaluate 
+         the following parameters:
+         * LongestContig.
+         * N_Contigs1K, N_Contigs10K, N_Contigs100K.
+         * DesviationEstimatedGenomeSize
+         * N50/L50
+
+         It will rank each parameter, and then it will select the lower sum of
+         the ranks.
+  
+      4- Once the best assembly has been selected will get the neighboors and 
+         calculate one/two new kmers.
+
+         * If the best assembly is KmerX it will perform KmerX+KmerB/2 
+           [+1 if it is EVEN].
+         * If the best assembly is KmerB it will perform KmerX+KmerB/2 
+           [+1 if it is EVEN] and KmerB+KmerA/2 [+a if it is EVEN].
+         * If the best assembly is KmerA it will perform KmerC+KmerA/2 
+           [+1 if it is EVEN] and KmerB+KmerA/2 [+a if it is EVEN].
+         * If the best assembly is KmerC it will perform KmerC+KmerY/2 
+           [+1 if it is EVEN] and KmerC+KmerA/2 [+a if it is EVEN].
+         * If the best assembly is KmerY it will perform KmerC+KmerY/2 
+           [+1 if it is EVEN].
+
+         After the assembly, it will evaluate all the assemblies again, 
+         selecting the best one and calculating the new kmers. The process will
+         end when the best assembly is found for a specific Kmer (KmerBest) and
+         the surrounding kmers have been calculated.
+
+      5- Once the best assembly has been found, it will continue running SSPACE
+         to scaffold the contigs. It will run first Bowtie2 keeping the mapped 
+         reads.
+  
+      6- It will run also GapCloser to fill the possible gaps.
+
+      7- After the scaffolding, the program will re-map the reads back to the 
+         assembly and calculate:
+     
+         * Coverage, using Bedtools.
+         * Heterozigosity and consensus call, using Freebayes
+         * Stats about the assembly
+ 
+    Flags:
+
+      -i <input_file_list>   four column file with filenames (mandatory)
+      -t <number_of_threads> number of threads (default 2)
+      -k <kmer_interval>     kmer interval to optimize it (default 31-95)  
+      -l <min_contig_length> minimum contig length (default 200 bp)
+      -o <output_dir>        output directory (mandatory)
+      -m <minia_arguments>   pass minia arguments '-arg1=val1,-arg2=val2'
+      -s <sspace_arguments>  pass sspace arguments '-arg1=val1,-arg2=val2' 
+      -V <be_verbose>        be verbose and print the parsing status.
+      -v <version>           print version
+      -h <help>              print the help
+
+
+EOF
+exit (1);
+}
+
+
+##############################################################################
+## Just a simple function to print a message with some format
+##############################################################################
+
+sub print_header {
+    my $message = shift;
+
+    my $date = `date`;
+    chomp($date);
+
+    print STDERR "\n";
+    print STDERR "============================================================";
+    print STDERR "\n $message ($date)\n";
+    print STDERR "============================================================";
+    print STDERR "\n\n";
+}
+
+###############################################################################
+## printlog($logfh, $step, $type, $message, $stderr_switch)
+## function to print a message in the log and in the STDERR if it is needed
+###############################################################################
+
+sub printlog {
+
+    my $logfh = shift();
+    my $step = shift(); 
+    my $type = shift(); 
+    my $message = shift(); 
+    my $stderr = shift();
+
+    ## First, get the time stamp
+    my $ts = `date +"%y-%m-%d %H:%M:%S"`;
+    chomp($ts); 
+   
+    ## Create the log printing line and print it
+    my $logpline = "$ts\t$step-$type:$message";
+    print $logfh "$logpline\n";
+
+    ## finally if STDERR is activated, print also a STDERR message
+    if ($stderr && $stderr == 1) {
+
+	print STDERR "\t$message\n";
+    }
+}
+
+
+###############################################################################
+## get_kmers() function
+## Function to calculate 5 kmers between two values
+## it will return an array
+###############################################################################
+
+sub get_kmers {
+    my $kmer_min = shift;
+    my $kmer_max = shift;
+
+    ## Check if both kmers are odd
+    my $kmin_obj = Math::BigFloat->new($kmer_min);
+    my $kmax_obj = Math::BigFloat->new($kmer_max);
+
+    if ($kmin_obj->is_even) {
+    
+	die("ERROR: kmer=$kmer_min is not an odd integer.\n"); 
+    }
+    if ($kmax_obj->is_even) {
+    
+	die("ERROR: kmer=$kmer_max is not an odd integer.\n"); 
+    }
+
+    ## Calculate the first intermediate value
+    my $kmer_a = ($kmer_min + $kmer_max) / 2;
+    my $ka_obj = Math::BigFloat->new($kmer_a);
+    if ($ka_obj->is_even) {
+    
+	$kmer_a++; 	
+    }
+
+    ## Calculate the other two intermediate values
+    my $kmer_b = ($kmer_min + $kmer_a) / 2;
+    my $kb_obj = Math::BigFloat->new($kmer_b);
+    if ($kb_obj->is_even) {
+    
+	$kmer_b++; 	
+    }
+    
+    my $kmer_c = ($kmer_a + $kmer_max) / 2;
+    my $kc_obj = Math::BigFloat->new($kmer_c);
+    if ($kc_obj->is_even) {
+    
+	$kmer_c++; 	
+    }
+
+    my @kmer_list = ($kmer_min, $kmer_b, $kmer_a, $kmer_c, $kmer_max); 
+
+    ## Remove the redundancy
+
+    my %uniqkmers = ();
+    foreach my $k (@kmer_list) {
+    
+	$uniqkmers{$k} = 1;
+    }
+
+    return sort({$a <=> $b} keys(%uniqkmers));;
+}
+
+###############################################################################
+## Function get_neighboor_kmers()
+## This function calculate the top and bottom kmers from five values
+## my ($kmer02min, $kmer02max) = get_neighboor_kmers(\@kmerlist, $bestkmer)
+## inputs: 1- \@kmerlist, a list of kmers
+##         2- $best_kmer, a kmer to get the neighboors
+## output: A- $kmer_min, min kmer
+##         B- $kmer_max, max kmer
+###############################################################################
+
+sub get_neighboor_kmers {
+    my $klist_aref = shift();
+    my $target_kmer = shift();
+
+    my @kmerlist = @{$klist_aref};
+
+    ## get the position of the kmer
+    my ($p, $t) = (0, 1000);
+    foreach my $k (@kmerlist) {
+    
+	if ($k == $target_kmer) {
+	
+	    $t = $p;
+	}
+	$p++;
+    }
+
+    ## Print an error if the target is not present
+    if ($t == 1000) {
+    
+	my $error = "ERROR: Function get_neighboor_kmers failed. ";
+	$error .= "$target_kmer is not in the list @kmerlist.";
+	die("$error\n");
+    }
+
+    ## If it is fine it will take $t - 1 and $t + 1 as neighboors
+    my $min = $t - 1;
+    my $max = $t + 1;
+    my $max_idx = scalar(@kmerlist) - 1;
+
+    if ($min < 0) {
+    
+	$min = 0;
+    }
+    if ($max > $max_idx) {
+
+	$max = $max_idx;
+    }
+
+    return($kmerlist[$min], $kmerlist[$max]); 
+}
+
+###############################################################################
+## Function est_genomesize()
+## Function to run jellyfish and GenomeScope for a list of kmers
+## inputs: 1- \@kmer_list01, arrayref with the list of integers with the kmers 
+##         2- \%infiles, hashref with list of input files
+##         3- \%exepath, hashref with the executable paths
+##         4- $threads, a scalar specifying the number of threads
+##         5- $s01_1_outpath, path for the output dir
+##         6- \%rm_switch, hashref with the remove file switches 
+## output: A- $egs_href, hashref with the estimated genome sizes produced with
+##            GenomeScope 
+##         B- $modelfit_egs_href, list of the model fit stats
+###############################################################################
+
+sub est_genomesize {
+
+    my $kmer_list_aref = shift();
+    my $inlibs_href = shift(); 
+    my $exepath_href = shift();
+    my $threads = shift();
+    my $outpath = shift();
+    my $rm_switch_href = shift();
+    my %rm_switch = %{$rm_switch_href};
+    my $logfh = shift();
+    
+    ## Define the output variables
+    my %estgenomesize = ();
+    my %modelfit_egs = ();
+
+    my $c = 0;
+    foreach my $kmer01 (@{$kmer_list_aref}) {
+
+	$c++;
+	print STDERR "\n\t2.$c Running Jellyfish for the kmer $kmer01\n\n";
+
+	## create a output name
+	my $s011_jfoutname = "JF_Kmer".sprintf("%03s", $kmer01)."_Count.jf"; 
+	my $s011_jfoutpath =  File::Spec->catfile($outpath, $s011_jfoutname);
+
+	## Create the command to run jellyfish
+    
+	my @s011_jellyfish_cmd = ("$exepath{'jellyfish'} count");
+    
+	## Add Kmer size
+	push(@s011_jellyfish_cmd, "-m $kmer01");
+
+	## Size of the hash depends of how much memory the system has
+	## probably it could be a good idea to set up as argument but for now
+	## keep at 1,000,000
+	push(@s011_jellyfish_cmd, "-s 1000000");
+ 
+	## Threads is already defined
+	push(@s011_jellyfish_cmd, "-t $threads ");
+
+	## It will add the out at the end
+	push(@s011_jellyfish_cmd, "-o $s011_jfoutpath");
+
+	## Finally it will add the files
+	foreach my $libname (sort keys %{$inlibs_href}) {
+
+	    my $libtype = $inlibs{$libname}->{type};
+	    my %libfiles = %{$inlibs{$libname}->{files}};
+	    foreach my $file_n (sort {$a <=> $b} keys %libfiles) {
+		
+		push(@s011_jellyfish_cmd, $libfiles{$file_n});
+	    }
+	}
+
+	## Generate the command and run it
+	my $s011_cmd = join(" ", @s011_jellyfish_cmd);
+
+	my $ts007 = `date +"%y-%m-%d %H:%M:%S"`;
+	chomp($ts007); 
+	unless (-e $s011_jfoutpath || $opt_F) {
+	    
+	    print $logfh "$ts007\t02REPORT: $s011_jfoutpath not found\n";
+	    print $logfh "$ts007\t02CMD: $s011_cmd\n";
+	    my @s011_run = run( command => $s011_cmd, verbose => $opt_V );
+	}
+	else {
+
+	    print STDERR "\n\tOutJFCountFile found:\n\t$s011_jfoutpath.\n";
+	    print STDERR "\tSkiping Jellyfish count command\n";
+	    print STDERR "\t(Use -F to force re-run)\n";
+	    print $logfh "$ts007\t02REPORT: $s011_jfoutpath found.\n";
+	    print $logfh "$ts007\t02REPORT: Skiping command: $s011_cmd\n";
+	}	
+
+	## Once the command has been run, it will need to run stats
+	my @s012_jellyfish_cmd = ("$exepath{'jellyfish'} stats");
+	my $s012_jfoutname = "JF_Kmer".sprintf("%03s", $kmer01)."_Stats.txt"; 
+	my $s012_jfoutpath =  File::Spec->catfile($outpath, $s012_jfoutname);
+	push(@s012_jellyfish_cmd, "-o $s012_jfoutpath");
+	push(@s012_jellyfish_cmd, "$s011_jfoutpath");
+	my $s012_cmd = join(" ", @s012_jellyfish_cmd);
+
+	my $ts008 = `date +"%y-%m-%d %H:%M:%S"`;
+	chomp($ts008); 
+	unless (-e $s012_jfoutpath || $opt_F) {
+	    
+	    print $logfh "$ts008\t02CMD: $s012_cmd\n";
+	    my @s012_run = run( command => $s012_cmd, verbose => $opt_V );
+	}
+	else {
+
+	    print STDERR "\n\tOutJFStatFile found:\n\t$s012_jfoutpath.\n";
+	    print STDERR "\tSkiping Jellyfish stats command\n";
+	    print STDERR "\t(Use -F to force re-run)\n\n";
+	    print $logfh "$ts008\t02REPORT: $s012_jfoutpath found.\n";
+	    print $logfh "$ts008\t02REPORT: Skiping command: $s012_cmd\n";
+	}
+
+	## And histo
+	my @s013_jellyfish_cmd = ("$exepath{'jellyfish'} histo");
+	my $s013_jfoutname = "JF_Kmer".sprintf("%03s", $kmer01)."_Histo.txt"; 
+	my $s013_jfoutpath =  File::Spec->catfile($outpath, $s013_jfoutname);
+	push(@s013_jellyfish_cmd, "-t $threads ");
+	push(@s013_jellyfish_cmd, "-o $s013_jfoutpath");
+	push(@s013_jellyfish_cmd, "$s011_jfoutpath");
+	my $s013_cmd = join(" ", @s013_jellyfish_cmd);
+
+	my $ts009 = `date +"%y-%m-%d %H:%M:%S"`;
+	chomp($ts009); 
+	unless (-e $s013_jfoutpath || $opt_F) {
+	    
+	    print $logfh "$ts009\t02CMD: $s013_cmd\n";
+	    my @s013_run = run( command => $s013_cmd, verbose => $opt_V );
+	}
+	else {
+
+	    print STDERR "\n\tOutJFHistoFile found:\n\t$s013_jfoutpath.\n";
+	    print STDERR "\tSkiping jellyfish histo command\n";
+	    print STDERR "\t(Use -F to force re-run)\n\n";
+	    print $logfh "$ts009\t02REPORT: $s013_jfoutpath found.\n";
+	    print $logfh "$ts009\t02REPORT: Skiping command: $s013_cmd\n";
+	}	
+
+	## It will rerun the GenomeScope because it does take to much time
+
+	## Once the histo file has been created it will run the GenomeScope R 
+	## script 
+	my @s014_GS_cmd = ("$exepath{'Rscript'} $ENV{GENOMESCOPE_RSCRIPT}");
+	push(@s014_GS_cmd, $s013_jfoutpath);
+	push(@s014_GS_cmd, $kmer01);
+	push(@s014_GS_cmd, $readlen);
+    
+	my $s014_jfoutname = "JF_Kmer".sprintf("%03s", $kmer01)."_GenomeScope"; 
+	my $s014_jfoutpath =  File::Spec->catfile($outpath, $s014_jfoutname);
+
+	unless (-e $s014_jfoutpath) {
+
+	    mkdir($s014_jfoutpath);
+	}
+	push(@s014_GS_cmd, $s014_jfoutpath);
+	my $s014_cmd = join(" ", @s014_GS_cmd);
+
+	my $ts010 = `date +"%y-%m-%d %H:%M:%S"`;
+	chomp($ts010); 
+	print $logfh "$ts010\t02CMD: $s014_cmd\n";
+	my @s014_run = run( command => $s014_cmd, verbose => $opt_V );
+    
+	## Once the script has been run, it will parse the summary.txt file
+	## to get the data
+
+	my $s015_jfoutpath = File::Spec->catfile($s014_jfoutpath,'summary.txt');
+    
+	## The file will have the following format
+	## GenomeScope version 1.0
+	## k = 47
+	## property                      min               max               
+	## Heterozygosity                1.58158%          1.63705%          
+	## Genome Haploid Length         10,203,650 bp     10,367,029 bp     
+	## Genome Repeat Length          8,377,047 bp      8,511,179 bp      
+	## Genome Unique Length          1,826,603 bp      1,855,850 bp      
+	## Model Fit                     76.2711%          93.7318%          
+	## Read Error Rate               3.93819%          3.93819%          
+
+	## Create a entry in the hash
+	$estgenomesize{$kmer01} = {};
+
+	open my $GS_summary_FH, '<', $s015_jfoutpath;
+	print $logfh "$ts010\t02REPORT: Parsing $s015_jfoutpath\n";
+
+	## Parse the file
+	while(<$GS_summary_FH>) {
+    	    
+	    chomp($_);
+	    print $logfh "$ts010\t02REPORT: PARSING $_\n";
+
+	    if ($_ =~ m/^Heterozygosity\s+(.+)%\s+(.+)%\s+$/) {
+	
+		$estgenomesize{$kmer01}->{Heterozygosity} = {
+		    min => $1, 
+		    max => $2
+		};
+	    }
+	    elsif ($_ =~ m/^Genome Haploid Length\s+(.+)\s+bp\s+(.+)\s+bp\s+$/){
+	    
+		$estgenomesize{$kmer01}->{GenomeHaploidLength} = {
+		    min => $1, 
+		    max => $2
+		};
+	    }
+	    elsif ($_ =~ m/^Genome Repeat Length\s+(.+)\s+bp\s+(.+)\s+bp\s+$/) {
+	    	    
+		$estgenomesize{$kmer01}->{GenomeRepeatLength} = {
+		    min => $1, 
+		    max => $2
+		};
+	    }
+	    elsif ($_ =~ m/^Genome Unique Length\s+(.+)\s+bp\s+(.+)\s+bp\s+$/){	
+	    	    
+		$estgenomesize{$kmer01}->{GenomeUniqueLength} = {
+		    min => $1, 
+		    max => $2
+		};
+	    }
+	    elsif ($_ =~ m/^Model Fit\s+(.+)%\s+(.+)%\s+$/) {
+		
+		$estgenomesize{$kmer01}->{ModelFit} = {
+		    min => $1, 
+		    max => $2
+		};
+		
+		## It will add also the model fit to calculate the best
+		$modelfit_egs{$kmer01 . "_min"} = $1;
+		$modelfit_egs{$kmer01 . "_max"} = $2;	    
+	    }
+	    elsif ($_ =~ m/Read Error Rate\s+(.+)%\s+(.+)%\s+$/) {
+		
+		$estgenomesize{$kmer01}->{ReadErrorRate} = {
+		    min => $1, 
+		    max => $2
+		};
+	    }          
+	}
+	close($GS_summary_FH); 
+
+	## Finally if it is switched the rm_switch{jellyfish_count} remove the
+	## file
+
+	if ($rm_switch{jellyfish_count} == 1) {
+    
+	    print STDERR "\n\tRemove jellyfish_count file switch ACTIVE.\n";
+	    print STDERR "\t...removing $s011_jfoutpath\n";
+	    print $logfh "$ts010\t02ACTION: Removing $s011_jfoutpath\n";
+	    unlink($s011_jfoutpath);
+	}
+    }
+
+    return(\%estgenomesize, \%modelfit_egs); 
+}
+
+###############################################################################
+## Function run_minia()
+## function to run the minia assembler on a set of reads
+## inputs: 1- \@kmer_list, arrayref with the list of integers with the kmers 
+##         2- \%infiles, hashref with list of input files
+##         3- \%exepath, hashref with the executable paths
+##         4- \%minia_args, a hashref with the minia arguments
+##         4- $outpath, path for the output dir
+##         5- \%rm_switch, hashref with the remove file switches 
+## output: A- %minia, a hash with the minia output files
+## example: my %minia01 = run_minia(\@kmer_list01, \%inlibs, \%exepath, 
+##                        \%minia_args, $s02_1_outpath, \%rm_switch); 
+###############################################################################
+
+sub run_minia {
+    my $kmerlist_aref = shift();
+    my $inlibs_href = shift();
+    my $exeptah_href = shift();
+    my $miniargs_href = shift();
+    my $outpath = shift();
+    my $rm_switch_href = shift();
+    my $logfh = shift();
+    my $step = shift();
+
+    ## Declare the hash that will collect the corresponding files
+
+    my %minia = ();
+
+    ## First, it will need to prepare the input file
+    ## The minia input file is a tab file with one file per line
+
+    my $s021_minia_in = "MiniaInputFile.txt"; 
+    my $s021_minia_in_path =  File::Spec->catfile($outpath, $s021_minia_in);
+
+    open my $minia_infh, '>', $s021_minia_in_path;
+    
+    print STDERR "\n";
+    printlog($logfh, $step, "ACTION", "$step.1 Generating Minia input file", 1);
+
+    foreach my $inlib (sort keys %{$inlibs_href}) {
+    
+	my %libfiles = %{$inlibs_href->{$inlib}->{files}};
+	foreach my $fileorder (sort keys %libfiles) {
+	
+	    print $minia_infh "$libfiles{$fileorder}\n";
+	}
+    }
+
+    ## Once the files have been added into a file it will create one running
+    ## command per kmer
+
+    ## The command will add the following command based in internal
+    ## parameters of the script: 
+    ## '-graph'  and '-in' will be the internal input file
+    ## '-traversal' modify the output, it will use the default (contig)
+    ## '-kmer-size' determined by the script (@kmerlist)
+    ## '-solid-kmers-out', '-out' and '-out-dir' will be written by the script
+    ## '-nb-cores' controled by the $thread option added previously
+    
+    printlog($logfh, $step, "ACTION", "$step.2 Running Minia assemblies", 1);
+
+    my $n = 0;
+    foreach my $kmer (@{$kmerlist_aref}) {
+    
+	$n++;
+
+	## Print a separator
+	printlog($logfh, $step, "SEP", "----------------------------------", 1);
+
+	my $msg10 = "$step.2.$n Running Minia assembly for kmer $kmer";
+	printlog($logfh, $step, "ACTION", $msg10, 1); 
+
+	## Generate the first entry for the minia hash
+	$minia{$kmer} = { status => "InProcess" };
+
+	## Build the command
+	my @s022_minia_cmd = ("$exepath{'minia'}");
+	push(@s022_minia_cmd, "-in $s021_minia_in_path");
+	push(@s022_minia_cmd, "-kmer-size $kmer");
+
+	## Generate name for outs
+	my $s022_miniabase =  "MiniaK".sprintf("%03s", $kmer);
+	my $s022_miniadir = $s022_miniabase . "_outdir";
+	my $s022_miniaout_path =  File::Spec->catfile($outpath, $s022_miniadir);
+
+	unless (-e $s022_miniaout_path) {
+	    
+	    mkdir($s022_miniaout_path);
+	}
+
+	my $s022_miniabase_path = File::Spec->catfile($s022_miniaout_path, 
+						      $s022_miniabase);
+
+
+	push(@s022_minia_cmd, "-out $s022_miniabase_path");
+
+	my $s022_miniakout = $s022_miniabase . "_solidkmer";
+	my $s022_miniakout_path = File::Spec->catfile($s022_miniaout_path, 
+						      $s022_miniakout);
+
+	push(@s022_minia_cmd, "-solid-kmers-out $s022_miniakout_path"); 	
+	push(@s022_minia_cmd, "-out-dir $s022_miniaout_path"); 
+
+	## Add the arguments
+	foreach my $miniarg (sort keys %{$miniargs_href}) {
+	
+	    push(@s022_minia_cmd, $miniarg . " ". $miniargs_href->{$miniarg});
+	}
+
+	## The predicted output will be
+
+	$minia{$kmer} = {
+	    contig_file  => $s022_miniabase_path . '.contigs.fa',
+	    h5_file      => $s022_miniabase_path . '.h5',
+	    h5_solidkmer => $s022_miniakout_path . '.h5'
+	};
+
+	## Check if the contig file is there before run the command
+
+	my $s022_cmd = join(" ", @s022_minia_cmd);
+	my $ctgfile = $minia{$kmer}->{contig_file};
+	my @s022_run = ();
+
+	unless (-e $ctgfile || $opt_F) {
+	    
+	    printlog($logfh, $step, "COMMAND", "$s022_cmd", 0);
+	    @s022_run = run( command => $s022_cmd, verbose => $opt_V );
+	    
+	    if ($s022_run[0] == 0) {
+	    
+		$minia{$kmer}->{status} = "Failed";
+		$minia{$kmer}->{error_message} = $s022_run[1];
+	    }
+	    else {
+	    
+		$minia{$kmer}->{status} = "Successful";
+	    }
+	}
+	else {
+
+	    printlog($logfh, $step, "REPORT", 
+		     "MiniaContigFile found:\n\t\t$ctgfile", 1);
+	    printlog($logfh, $step, "ACTION", "Skipping Minia Command", 1);
+	    $minia{$kmer}->{status} = "PreviouslySuccessful";
+	}	
+		
+	## Check that minia produced an assembly
+
+	if (-e $ctgfile) {
+
+	    my $msg12 = "$step.2.$n Minia assembly for kmer $kmer is done\n";
+	    printlog($logfh, $step, "REPORT", $msg12, 1); 
+	    
+	    ## Finally it will get some stats from the file running seqtk
+	
+	    my $msg13 = "$step.3.$n Getting stats for the Minia assembly\n";
+	    printlog( $logfh, $step, "ACTION", $msg13, 1);
+	
+	    my @s023_seqtk_cmd = ("$exepath{'seqtk'} comp ");
+	    push(@s023_seqtk_cmd, "$minia{$kmer}->{contig_file}");
+
+	    ## get only the first one sorted column to save space
+	    push(@s023_seqtk_cmd, "| cut -f2 | sort -nr");
+	    
+	    ## and create the output
+	    my $s023_seqtkout_path = $s022_miniabase_path.'contig.slength.txt';
+	    push(@s023_seqtk_cmd, "> $s023_seqtkout_path");
+	
+	    my $s023_cmd = join(" ", @s023_seqtk_cmd);
+	
+	    printlog($logfh, $step, "COMMAND", "$s023_cmd", 1);
+	    my @s023_run = run( command => $s023_cmd, verbose => $opt_V );   
+
+	    ## Once the lengths have been calculated the script will read the
+	    ## files and calculate the following stats:
+
+	    my @ctgstats_names = ( 'total_assembly_size', 'total_contig_n',
+				   'average_contig_length', 'Ctg100', 'Ctg1000',
+				   'Ctg10000', 'Ctg100000', 'Size100', 
+				   'Size1000', 'Size10000', 'Size100000', 
+				   'N90','N80','N70','N60','N50','N40','N30',
+				   'N20','N10','L90','L80','L70','L60','L50',
+				   'L40','L30','L20','L10','T90','T80','T70',
+				   'T60','T50','T40','T30','T20','T10' 
+		);
+	    my $ctgstats = {};
+	    foreach my $st (@ctgstats_names) {
+	
+		$ctgstats->{$st} = 0;
+	    }
+
+	    open my $ctglength_fh, '<', $s023_seqtkout_path;
+	
+	    my @length_list = ();
+	
+	    while(<$ctglength_fh>) {
+	
+		chomp($_);
+		$ctgstats->{total_assembly_size} += $_;
+		$ctgstats->{total_contig_n}++;
+		
+		my @sizelist = (100, 1000, 10000, 100000);
+		foreach my $sz (@sizelist) {
+		    if ($_ >= $sz) {
+			
+			$ctgstats->{"Size".$sz} += $_;
+			$ctgstats->{"Ctg".$sz}++;
+		    }
+		}
+		
+		push(@length_list, $_);
+	    }
+	    
+	    ## Finally it will calculate average
+	    $ctgstats->{average_contig_length} = 
+		$ctgstats->{total_assembly_size} / $ctgstats->{total_contig_n};
+	    
+	    ## And the N's and L's values
+	    foreach my $l (@length_list) {
+		
+		foreach my $p ((10, 20, 30, 40, 50, 60, 70, 80, 90)) {
+		    
+		    my $psize = $ctgstats->{total_assembly_size} * $p / 100;
+		    
+		    if ($ctgstats->{"T".$p} <= $psize) {
+			
+			$ctgstats->{"T".$p} += $l;
+			$ctgstats->{"L".$p} = $l;
+			$ctgstats->{"N".$p}++;
+		    }
+		}	
+	    }
+	    
+	    ## Finally transfer the data and print a stats file
+	    my $s023_stats_path = $s022_miniabase_path.'contig.stats.txt';
+	    open my $st_fh, '>', $s023_stats_path;
+	    foreach my $sname (@ctgstats_names) {
+		
+		print $st_fh "$sname\t$ctgstats->{$sname}\n";
+		printlog($logfh, $step, "REPORT", 
+			 "$sname\t$ctgstats->{$sname}", 0);
+	    }
+	    
+	    $minia{$kmer}->{contig_stats} = $ctgstats;
+	}
+	else {
+	
+	    my $msg15 = "\nMinia assembler failed\n$s022_run[1]\n";
+	    printlog($logfh, $step, "WARNING", $msg15, 1);
+	}
+    }
+
+    ## Return the hash with the output files
+    
+    return(%minia);
+}
+
+###############################################################################
+## Function to get the best assembly
+## my $bestkmer01 = get_bestkmer(\%minia01, $optimalGS, $outdir, $logfh);
+## input: \%minia, is a hash ref with the assembly stats
+##        $optimalGS, is an scalar with a genome size value
+##        $logfh, is the log file handle
+## output: a kmer value
+###############################################################################
+
+sub get_bestkmer {
+
+    my $minia_href = shift();
+    my $optimal_gs = shift();
+    my $outdir = shift();
+    my $logfh = shift();
+    my $sumfh = shift();
+
+    my %minia = %{$minia_href};
+
+    ## The function will rank a serie of parameters:
+    ## 1- 01GSOADF = [(OptimalGS - AssemblyGS)]
+    ## 2- 02GSO5DF = [(OptimalGS - Size100000] / Ctg100000;
+    ## 3- 03GSO4DF = [(OptimalGS - Size10000] / Ctg10000;
+    ## 4- 04GSO3DF = [(OptimalGS - Size1000] / Ctg1000;
+    ## 5- 05GS90TN = [(OptimalGS - T90)] / N90
+    ## 6- 06GS50TN = [(OptimalGS - T50)] / N50
+   
+    ## Sometimes values such as Ctg100000 can be zero. In order to avoid 
+    ## a zero division it will use a default alt. to zero that it is
+    
+    my $alt2zero = 1000000000000;
+
+    ## Once every assembly has been ranked, it will sum the ranks and select
+    ## the lower one
+ 
+    my %rankstats = (
+	'01GSOADF' => {},
+	'02GSO5DF' => {},
+	'03GSO4DF' => {},
+	'04GSO3DF' => {},
+	'05GS90TN' => {},
+	'06GS50TN' => {}   
+	);
+
+    my %kmer_tranks = ();
+    my %kmer_tstats = ();
+
+    foreach my $kmer (sort keys %minia) {
+
+	if (exists $minia{$kmer}->{contig_stats}) {
+	    
+	    $kmer_tranks{$kmer} = 0;
+	    $kmer_tstats{$kmer} = {};
+
+	    my %ast = %{$minia{$kmer}->{contig_stats}};
+	    
+	    ## 1- 01GSOADF = [(OptimalGS - AssemblyGS)]
+	    my $n01 = Math::BigInt->new($optimalGS - $ast{total_assembly_size});
+	    $rankstats{'01GSOADF'}->{$kmer} = $n01->babs()->bstr();
+
+	    ## 2- 02GSO5DF = [(OptimalGS - Size100000] / Ctg100000;
+
+	    my $ctg1 = $ast{Ctg100000} || $alt2zero;
+	    my $n02 = Math::BigInt->new($optimalGS - $ast{Size100000});
+	    $rankstats{'02GSO5DF'}->{$kmer} = $n02->babs()->bdiv($ctg1)->bstr();
+
+	    ## 3- 03GSO4DF = [(OptimalGS - Size10000] / Ctg10000;
+
+	    my $ctg2 = $ast{Ctg10000} || $alt2zero;
+	    my $n03 = Math::BigInt->new($optimalGS - $ast{Size10000});
+	    $rankstats{'03GSO4DF'}->{$kmer} = $n03->babs()->bdiv($ctg2)->bstr();
+
+	    ## 4- 04GSO3DF = [(OptimalGS - Size1000] / Ctg1000;
+
+	    my $ctg3 = $ast{Ctg1000} || $alt2zero;
+	    my $n04 = Math::BigInt->new($optimalGS - $ast{Size1000});
+	    $rankstats{'04GSO3DF'}->{$kmer} = $n04->babs()->bdiv($ctg3)->bstr();
+
+	    ## 5- 05GS90TN = [(OptimalGS - T90)] / N90
+	    
+	    my $en90 = $ast{N90} || $alt2zero;
+	    my $n05 = Math::BigInt->new($optimalGS - $ast{T90});
+	    $rankstats{'05GS90TN'}->{$kmer} = $n05->babs()->bdiv($en90)->bstr();
+
+	    ## 6- 06GS50TN = [(OptimalGS - T50)] / N50
+	    my $en50 = $ast{N50} || $alt2zero;
+	    my $n06 = Math::BigInt->new($optimalGS - $ast{T50});
+	    $rankstats{'06GS50TN'}->{$kmer} = $n06->babs()->bdiv($en50)->bstr();
+	}
+    }
+
+    ## Once the stats have been calculated, it will create the ranks for 
+    ## 01GSOADF, 02GSO5DF, 03GSO4DF, 04GSO3DF, 05GS90TN, 06GS50TN
+
+    my @header = ('Kmer', "TotalRank");
+    my %sumlines = ();
+
+    foreach my $stat (sort keys %rankstats) {
+    
+	my %statype = %{$rankstats{$stat}};
+	my @sorted_kmers = sort {$statype{$a} <=> $statype{$b}} keys %statype;
+	push(@header, $stat);
+
+	$sumlines{$stat} = [$stat];
+	my $u = 0;
+	my $r = 0;
+	foreach my $k (@sorted_kmers) {
+	    
+	    ## Once the values have been sorted it will assign the ranks
+	    ## but sometimes some values are the sample so it should not
+	    ## add a rank if it is the case
+
+	    if ($u > 0) {
+	    
+		my $prev_kmer = $sorted_kmers[$u-1];
+		my $prev_stat = $kmer_tstats{$prev_kmer}->{$stat};
+		my $curr_stat = $statype{$k};
+
+		if ($prev_stat < $curr_stat) {
+		
+		    $r++;
+		}
+	    }
+	    else {
+	    
+		$r++;
+	    }
+	    
+	    $kmer_tranks{$k} += $r;
+	    $kmer_tstats{$k}->{$stat} = $statype{$k};
+	    push(@{$sumlines{$stat}}, $statype{$k});
+
+	    $u++;
+	}
+    }
+
+    ## Once the ranks have been calculated, it will sort them and print
+    ## the results
+
+    my @BestK = sort {$kmer_tranks{$a} <=> $kmer_tranks{$b}} keys %kmer_tranks;
+
+    my $s041_ranks_in = "AssemblyRanks.txt"; 
+    my $s041_ranks_in_path =  File::Spec->catfile($outdir, $s041_ranks_in);
+    open my $ranksfh, '>', $s041_ranks_in_path;
+
+    print $ranksfh "## Minia Assemblies Rank Report\n";
+    print $ranksfh "##\t01GSOADF = [(OptimalGS - AssemblyGS)]\n";
+    print $ranksfh "##\t02GSO5DF = [(OptimalGS - Size100000] / Ctg100000\n";
+    print $ranksfh "##\t03GSO4DF = [(OptimalGS - Size10000] / Ctg10000\n";
+    print $ranksfh "##\t04GSO3DF = [(OptimalGS - Size1000] / Ctg1000\n";
+    print $ranksfh "##\t05GS90TN = [(OptimalGS - T90)] / N90\n";
+    print $ranksfh "##\t06GS50TN = [(OptimalGS - T50)] / N50\n## HEADER\n";
+   
+    my $pheader = join("\t", @header);
+    print $ranksfh "##$pheader\n";
+    
+    foreach my $k (@BestK) {
+    
+	my @pline = ($k, $kmer_tranks{$k});
+	foreach my $s (sort keys %{$kmer_tstats{$k}}) {
+	
+	    push(@pline, $kmer_tstats{$k}->{$s}); 
+	}
+	
+	my $pline = join("\t", @pline);
+	print $ranksfh "$pline\n";
+    }
+    
+    ## It will add also these stats to the assembly summary
+    foreach my $st01 (sort keys %sumlines) {
+    
+	my $ppline = join("\t", @{$sumlines{$st01}});
+	print $sumfh "$ppline\n"; 
+    }
+
+    ## Finally it will return the best kmer
+    
+    return($BestK[0]);
+}
+
+
+###############################################################################
+## Function to run SSPACE
+## It will run SSPACE
+## use run_sspace($exe_href, $sspace_href, $inlibs_href, $ctgfile, $sspace_out,
+##                $logfh)
+###############################################################################
+
+sub run_sspace {
+    my $exe_href = shift();
+    my $sspace_arg_href = shift();
+    my $inlibs_href = shift();
+    my $ctgfile = shift();
+    my $sspace_out = shift();
+    my $logfh = shift();
+
+    my %exepath = %{$exe_href};
+    my %sspace_args = %{$sspace_arg_href};
+    my %inlibs = %{$inlibs_href};
+
+    ## First it will map the reads using Bowtie2
+
+    printlog($logfh, 10, "ACTION", "Mapping reads to $ctgfile", 1); 
+
+    ## 0- Copy the ctg_file to the sspace dir
+
+    printlog($logfh, 10, "ACTION", "Copying $ctgfile to $sspace_out dir", 1);
+    copy($ctgfile, $sspace_out);
+
+    ## Create the index for the contig file
+
+    my ($ctgname, $ctgdir, $ctgsuf) = fileparse($ctgfile);
+    my $ctgbase = $ctgname;
+    $ctgbase =~ s/\.fa//;
+    my $ctgindex_path = File::Spec->catfile($sspace_out, $ctgbase);
+
+    my @b2bcmd = ($exepath{'bowtie2-build'}, $ctgfile, $ctgindex_path);
+    
+    my $b2brun_cmd = join(" ", @b2bcmd);
+
+    unless (-e $ctgindex_path.".1.bt2" || $opt_F) {
+	    
+	printlog($logfh, 10, "ACTION", "Running bowtie2-build command", 1);
+	printlog($logfh, 10, "COMMAND", $b2brun_cmd, 0);
+	my @b2brun = run( command => $b2brun_cmd, verbose => $opt_V );
+	    
+	if ($b2brun[0] == 0) {
+	    
+	    my $error = "Bowtie2-build command has failed: $b2brun[1]";
+	    printlog($logfh, 10, "ERROR", $error, 1);
+	    die("\nERROR: $error\n");
+	}
+	else {
+	    
+	    printlog($logfh, 10, "REPORT", 
+		     "Bowtie2-build has created the indexes for $ctgfile", 1);
+	}
+    }
+    else {
+	
+	printlog($logfh, 10, "REPORT", 
+		 "Bowtie2-build index file found:\n\t\t$ctgindex_path.1.1bt",1);
+	printlog($logfh, 10, "ACTION", "Skipping Bowtie2-build Command", 1);
+    }	    
+
+    ## Supposing that it has been successfull, the next step will be to map 
+    ## the files
+
+    my %mapfiles = ();
+    my %insertsize = ();
+
+    foreach my $lib (sort keys %inlibs) {
+    
+	## it will build the mapping command
+	my @bwt2cmd = ($exepath{'bowtie2'}, "-p", $sspace_args{"-T"});
+	push(@bwt2cmd, ("-x", $ctgindex_path));
+	
+	my %files = %{$inlibs{$lib}->{files}};
+	my $o = 1;
+	foreach my $fo (sort keys %files) {
+	
+	    my $argtag = '-'.$o;
+	    push(@bwt2cmd, ($argtag, $files{$fo})); 
+	    $o++;
+	}
+	
+	## Concatenate the output into samtools
+	my $outmap = $lib. ".Bwt2Map2".$ctgbase.".bam";
+	my $outmap_path = File::Spec->catfile($sspace_out, $outmap);
+
+	push(@bwt2cmd, ("|", $exepath{'samtools'}, "view", "-F4", "-Sb"));
+	push(@bwt2cmd, ("-o", $outmap_path, "-"));
+
+	my $bwt2run_cmd = join(" ", @bwt2cmd); 
+
+	unless (-e $outmap_path || $opt_F) {
+
+	    printlog($logfh, 10, "ACTION", "Running bowtie2 command", 1);
+	    printlog($logfh, 10, "COMMAND", $bwt2run_cmd, 0);
+	    my @bwt2run = run( command => $bwt2run_cmd, verbose => $opt_V );
+	    $mapfiles{$lib} = $outmap_path;
+
+	    ## Additionally it will sort the bam file
+	
+	    my @bamsortcmd = ($exepath{'samtools'}, "sort", "-o", $outmap_path);
+	    push(@bamsortcmd, ($outmap_path));
+
+	    my $bamsortrun_cmd = join(" ", @bamsortcmd); 
+	    printlog($logfh, 10, "ACTION", "Running samtools sort command", 1);
+	    printlog($logfh, 10, "COMMAND", $bamsortrun_cmd, 0);
+	    my @bamsortrun = run(command => $bamsortrun_cmd, verbose => $opt_V);
+
+	    if ($bwt2run[0] == 0) {
+	    
+		my $error = "Bowtie2 command has failed: $bwt2run[1]";
+		printlog($logfh, 10, "ERROR", $error, 1);
+		die("\nERROR: $error\n");
+	    }
+	    else {
+	    
+		printlog($logfh, 10, "REPORT", "Bowtie2 was successful run", 1);
+	    }
+	}
+	else {
+	
+	    printlog($logfh, 10, "REPORT", 
+		 "Bowtie2 bam file found:\n\t\t$outmap_path", 1);
+	    printlog($logfh, 10, "ACTION", "Skipping Bowtie2 Command", 1);
+	}
+	    
+	## Once the file has been sorted, it will calculate the insert size
+	## using picard tools
+
+	my @picardcmd = ($exepath{'picard-tools'}, "CollectInsertSizeMetrics");
+	my $pichist = $lib. ".Bwt2Map2".$ctgbase.".PicardCISM.histo.txt";
+	my $pichist_path = File::Spec->catfile($sspace_out, $pichist);
+	push(@picardcmd, "HISTOGRAM_FILE=$pichist_path");
+	push(@picardcmd, "INPUT=$outmap_path");
+	my $picout = $lib. ".Bwt2Map2".$ctgbase.".PicardCISM.out.txt";
+	my $picout_path = File::Spec->catfile($sspace_out, $pichist);
+	push(@picardcmd, "OUTPUT=$picout_path");
+	push(@picardcmd, "REFERENCE_SEQUENCE=$ctgname");
+
+	my $picardrun_cmd = join(" ", @picardcmd); 
+
+	unless (-e $picout_path || $opt_F) {
+
+	    printlog($logfh, 10, "ACTION", "Running picard-tools command", 1);
+	    printlog($logfh, 10, "COMMAND", $picardrun_cmd, 0);
+	    my @picardrun = run( command => $picardrun_cmd, verbose => $opt_V );
+	    
+	    if ($picardrun[0] == 0) {
+		
+		my $error = "Picard-tools command has failed: $picardrun[1]";
+		printlog($logfh, 10, "ERROR", $error, 1);
+		die("\nERROR: $error\n");
+	    }
+	    else {
+	    
+		printlog($logfh, 10, "REPORT", "Picard was successful run", 1);
+	    }
+	}
+	else {
+	
+	    printlog($logfh, 10, "REPORT", 
+		 "Picard tools out file found:\n\t\t$picout_path",1);
+	    printlog($logfh, 10, "ACTION", "Skipping Picard Command", 1);
+	}
+	
+    }
+
+    ## First create the library input file for SSPACE
+    ## It needs to have the format:
+    ## libname bowtie file1_path file2_path insertsize sd_insertsize libtype 
+
+    my $sspacelib_file = "SSPACELibraryInputFiles.txt";
+    my $sspacelib_path = File::Spec->catfile($sspace_out, $sspacelib_file);
+    open my $sspacelib_fh, '>', $sspacelib_path;
+    foreach my $libid (sort keys %inlibs) {
+    
+	my @pline = ($libid, 'bowtie');
+	my %files = %{$inlibs{$libid}->{files}};
+	foreach my $o (sort keys %files) {
+	
+	    push(@pline, $files{$o}); 
+	}
+	
+	
+    }
+    
+ 
+}
+
+
